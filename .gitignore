@@ -137,3 +137,8 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# 本地抓包/临时文件（含登录凭据，切勿提交）
+/a
+/Burp*.xml
+*.burp
