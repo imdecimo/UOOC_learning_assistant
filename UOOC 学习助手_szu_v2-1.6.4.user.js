@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         UOOC 学习助手_szu_v2
 // @namespace    https://github.com/imdecimo/UOOC_learning_assistant
-// @version      1.5.1
+// @version      1.6.4
 // @author       decimo
-// @description  自动静音、二倍速、自动连播、自动答题(视频中非测验)、自动刷评论。递归刷课可开关，带视频看门狗与任务熔断。
+// @description  自动静音、二倍速、自动连播、自动答题(视频中非测验)、自动刷评论。兼容新旧版学习页，递归刷课可开关，带视频看门狗与任务熔断。
 // @license      GPL
 // @match        *://www.uooc.net.cn/*
 // @match        *://uooc.net.cn/*
@@ -17,12 +17,20 @@
 (function () {
     "use strict";
 
+    // 学习页里嵌了同源的 /ai/studybuddy iframe，脚本会在里面再跑一遍并画出多余的悬浮按钮
+    try {
+        if (window.top && window.self && window.top !== window.self) return;
+    } catch (err) {
+        return;
+    }
+
     // ================= 可配置区 =================
     const CONFIG = {
         speed: 2,                 // 播放倍速
         mute: true,               // 自动静音
         tickMs: 250,              // 统一调度循环间隔
         videoBootMs: 20000,       // 点击小节后等待新视频加载的时间
+        catalogWaitMs: 4000,      // 展开大章/等待小节资源列表的时间
         videoStallMs: 120000,     // 播放进度停滞多久判定卡死
         videoMaxMs: 3 * 60 * 60 * 1000, // 单个视频最长等待
         maxNodeFailures: 2,       // 同一小节失败几次后跳过
@@ -33,7 +41,7 @@
             topicType: 30,        // 课程讨论区类型
             minGapMs: 20000,      // 两条评论最小间隔
             maxGapMs: 40000,      // 两条评论最大间隔
-            maxFailures: 3,       // 连续失败几次触发冷却
+            maxFailures: 5,       // 连续失败几次触发冷却（发帖过快被拒时靠短间隔重试兜住）
             cooldownMs: 120000,   // 冷却时长
             defaultTarget: 10,    // 默认目标条数
             maxTarget: 500,
@@ -277,11 +285,10 @@
     let rushPending = false;
     let idleRounds = 0;
     let acted = 0;
-    let failedNodes = new WeakMap();
+    // 用「小节id#资源序号」这种稳定 key 记账：Angular 会重建 ng-if 子树，
+    // 拿 DOM 元素当 key 的话失败计数会随元素换代清零，导致坏视频被无限重试
     let playedKeys = new Set();
-
-    const nodeFailures = (node) => failedNodes.get(node) || 0;
-    const failNode = (node) => failedNodes.set(node, nodeFailures(node) + 1);
+    let failedKeys = new Map();
 
     function nodeLabel(node) {
         if (!node) return "未知小节";
@@ -297,18 +304,51 @@
     }
 
     // ---- 课程目录 ----
-    // UOOC 学习页是 Angular 状态驱动渲染，目录层级按需生成：
-    //   ul.rank-1 > li.catalogItem
-    //     > div.basic.chapter            大章头（点击切 chapterId）
-    //     > ul.rank-2                    仅当前大章渲染
-    //         > li#小节id > div.basic    小节（点击切 sectionId）
-    //         > div.resourcelist         仅当前小节渲染
-    //             > div.basic            资源项（span.icon-video 表示视频）
-    //         > ul.rank-3 > li           小节下的三级节点，结构同小节
-    const CATALOG_SELECTOR = "ul.rank-1, .rank-1";
-    const CHAPTER_HEADER = "div.basic.chapter";
-    const SECTION_LIST = "ul.rank-2";
-    const RESOURCE_LIST = ".resourcelist";
+    // UOOC 是 Angular 状态驱动渲染：大章选中才渲染 ul.level_2，小节选中才渲染资源列表。
+    // 旧版 /home/learn/index：
+    //   ul.rank-1 > li > div.basic.chapter + ul.rank-2 > li > div.basic + div.resourcelist > div.basic
+    // 新版 /home/learn/new/{cid}：
+    //   ul.newlearn_left_card_chapter_list > li > div.level_1_title + ul.level_2 > li
+    //     > div.level_2_title(id_小节id) + div.level_2_resourcelist > div.level_2_resourcelist_item
+    //   三级节点为 ul.level_3 > div.level_3_title + div.level_3_resourcelist
+    const PAGES = [
+        {
+            name: "newlearn",
+            detect: () => !!document.querySelector(".newlearn"),
+            catalogRoot: ".newlearn_left_card_chapter_list",
+            chapterHeader: "div.level_1_title",
+            sectionList: "ul.level_2",
+            pointList: "ul.level_3",
+            nodeHead: "div[class*='_title']",
+            resourceList: "[class*='resourcelist']",
+            resourceItem: "[class*='resourcelist_item']",
+            isComplete: (node) => !!node.querySelector("[class*='item_icon_check']"),
+            isVideo: (node) => !!node.querySelector("img[src*='video']")
+        },
+        {
+            name: "legacy",
+            detect: () => !!document.querySelector("ul.rank-1, .rank-1"),
+            catalogRoot: "ul.rank-1, .rank-1",
+            chapterHeader: "div.basic.chapter",
+            sectionList: "ul.rank-2",
+            pointList: "ul.rank-3",
+            nodeHead: "div.basic",
+            resourceList: ".resourcelist",
+            resourceItem: ".basic",
+            isComplete: (node) => node.classList.contains("complete"),
+            isVideo: (node) => !!node.querySelector(".icon-video")
+        }
+    ];
+    let PAGE = null;
+
+    function detectPage() {
+        for (const profile of PAGES) {
+            try {
+                if (profile.detect()) return profile;
+            } catch (err) { /* 探测失败继续下一个 */ }
+        }
+        return null;
+    }
 
     async function waitFor(getter, timeoutMs) {
         const deadline = Date.now() + timeoutMs;
@@ -321,68 +361,71 @@
         return null;
     }
 
-    // 模板里 icon-xiangxia 表示"未展开/未选中"
+    // 旧版折叠图标是 i.icon-xiangxia，新版是 img[src*=xiangxia]
     function isCollapsed(node) {
-        const icon = node ? node.querySelector("i") : null;
-        return !!(icon && icon.classList.contains("icon-xiangxia"));
+        if (!node) return false;
+        return !!node.querySelector("i[class*='icon-xiangxia'], img[src*='xiangxia']");
     }
 
     function getChapterLis() {
-        const root = document.querySelector(CATALOG_SELECTOR);
+        if (!PAGE) return [];
+        const root = document.querySelector(PAGE.catalogRoot);
         if (!root) return [];
-        return Array.from(root.children).filter((li) => li.querySelector(CHAPTER_HEADER));
+        return Array.from(root.children).filter((li) => li.tagName === "LI" && li.querySelector(PAGE.chapterHeader));
     }
 
     // Angular 每次状态变更都会重建 ng-if 子树，所以一律按索引重新查，不持有元素引用
     const chapterAt = (ci) => getChapterLis()[ci] || null;
     const sectionLisAt = (ci) => {
         const chapterLi = chapterAt(ci);
-        return chapterLi ? Array.from(chapterLi.querySelectorAll(":scope > " + SECTION_LIST + " > li")) : [];
+        return chapterLi ? Array.from(chapterLi.querySelectorAll(":scope > " + PAGE.sectionList + " > li")) : [];
     };
     const sectionAt = (ci, si) => sectionLisAt(ci)[si] || null;
     const pointAt = (ci, si, pi) => {
         const sectionLi = sectionAt(ci, si);
         if (!sectionLi) return null;
-        return sectionLi.querySelectorAll(":scope > ul.rank-3 > li")[pi] || null;
+        return sectionLi.querySelectorAll(":scope > " + PAGE.pointList + " > li")[pi] || null;
     };
     const pointCount = (ci, si) => {
         const sectionLi = sectionAt(ci, si);
-        return sectionLi ? sectionLi.querySelectorAll(":scope > ul.rank-3 > li").length : 0;
+        return sectionLi ? sectionLi.querySelectorAll(":scope > " + PAGE.pointList + " > li").length : 0;
     };
 
     async function openChapterAt(ci) {
         const chapterLi = chapterAt(ci);
         if (!chapterLi) return false;
-        if (chapterLi.querySelector(":scope > " + SECTION_LIST)) return true;
-        const header = chapterLi.querySelector(":scope > " + CHAPTER_HEADER) || chapterLi.querySelector(CHAPTER_HEADER);
+        if (chapterLi.querySelector(":scope > " + PAGE.sectionList)) return true;
+        const header = chapterLi.querySelector(":scope > " + PAGE.chapterHeader) || chapterLi.querySelector(PAGE.chapterHeader);
         if (!header) return false;
         if (isCollapsed(header)) header.click();
         return !!(await waitFor(() => {
             const live = chapterAt(ci);
-            const list = live && live.querySelector(":scope > " + SECTION_LIST);
+            const list = live && live.querySelector(":scope > " + PAGE.sectionList);
             return list && list.children.length ? list : null;
-        }, 8000));
+        }, CONFIG.catalogWaitMs));
     }
 
     // 小节/三级节点：点击后会异步拉 getUnitLearn，资源列表才出现
     async function openNodeAt(getNode) {
         const node = getNode();
         if (!node) return null;
-        if (node.querySelector(":scope > " + RESOURCE_LIST)) return node;
-        const head = node.querySelector(":scope > div.basic");
+        if (node.querySelector(":scope > " + PAGE.resourceList)) return node;
+        const head = node.querySelector(":scope > " + PAGE.nodeHead);
         if (!head) return null;
         if (isCollapsed(head)) head.click();
         return await waitFor(() => {
             const live = getNode();
-            return live && live.querySelector(":scope > " + RESOURCE_LIST) ? live : null;
-        }, 8000);
+            return live && live.querySelector(":scope > " + PAGE.resourceList) ? live : null;
+        }, CONFIG.catalogWaitMs);
     }
 
-    function isVideoResource(node) {
-        if (!node) return false;
-        if (node.querySelector(".icon-video")) return true;
-        const name = node.querySelector(".tag-source-name");
-        return /视频/i.test(name ? name.innerText || name.textContent || "" : "");
+    // 新版节的 id 挂在头元素上（id_小节id），旧版挂在小节 li 上
+    function nodeKey(container) {
+        if (!container) return "x";
+        if (container.id) return container.id;
+        const head = container.querySelector(":scope > " + PAGE.nodeHead);
+        if (head && head.id) return head.id;
+        return nodeLabel(container);
     }
 
     async function playResourceList(getContainer) {
@@ -390,24 +433,25 @@
             if (!autoRecursiveFlag) return;
             const container = getContainer();
             if (!container) return;
-            const list = container.querySelector(":scope > " + RESOURCE_LIST);
+            const list = container.querySelector(":scope > " + PAGE.resourceList);
             if (!list) return;
-            const resources = Array.from(list.querySelectorAll(":scope > .basic"));
-            const keyBase = container.id || nodeLabel(container);
+            const resources = Array.from(list.querySelectorAll(":scope > " + PAGE.resourceItem));
+            const keyBase = nodeKey(container);
             let played = false;
             for (let index = 0; index < resources.length; index++) {
                 const resource = resources[index];
-                if (resource.classList.contains("complete")) continue;
-                if (!isVideoResource(resource) || isQuizNode(resource)) continue;
+                if (PAGE.isComplete(resource)) continue;
+                if (!PAGE.isVideo(resource) || isQuizNode(resource)) continue;
                 const key = keyBase + "#" + index;
                 if (playedKeys.has(key)) continue;
-                if (nodeFailures(resource) >= CONFIG.maxNodeFailures) continue;
+                if ((failedKeys.get(key) || 0) >= CONFIG.maxNodeFailures) continue;
                 acted += 1;
                 if (await playVideoNode(resource)) {
                     playedKeys.add(key);
+                    failedKeys.delete(key);
                     played = true;
                 } else {
-                    failNode(resource);
+                    failedKeys.set(key, (failedKeys.get(key) || 0) + 1);
                 }
                 break;
             }
@@ -506,9 +550,14 @@
     }
 
     async function traverse() {
+        PAGE = detectPage();
+        if (!PAGE) {
+            log("未识别到课程目录（旧版 rank-1 / 新版 newlearn 都没找到）");
+            return;
+        }
         const total = getChapterLis().length;
         if (!total) {
-            log("未找到课程目录，当前可能不在学习页");
+            log("未找到课程目录（" + PAGE.name + "），当前可能不在学习页");
             return;
         }
         acted = 0;
@@ -625,16 +674,25 @@
         }
 
         function resolveCid() {
-            const fromPath = location.pathname.match(/\/home\/course\/(\d+)/);
+            const path = location.pathname || "";
+            const hash = location.hash || "";
+            const search = location.search || "";
+            const fromPath = path.match(/\/home\/(?:course|learn\/new)\/(\d{6,})/);
             if (fromPath) return fromPath[1];
-            const cookie = document.cookie.match(/(?:^|;\s*)formpath=([^;]+)/);
-            if (cookie) {
-                const decoded = decodeURIComponent(cookie[1]);
-                const fromCookie = decoded.match(/(?:course|course_contents)\/(\d{6,})/);
-                if (fromCookie) return fromCookie[1];
-            }
-            const fromQuery = (location.search + location.hash).match(/[?&#/]cid=(\d+)/);
+            // 学习页把课程 id 放在 hash 里：#/<课程id>/<小节id>/<资源id>
+            const fromHash = hash.match(/#\/?(\d{6,})(?:\/|$)/);
+            if (fromHash) return fromHash[1];
+            const fromQuery = (search + hash).match(/[?&#]cid=(\d+)/);
             if (fromQuery) return fromQuery[1];
+            // cookie 兜底只在课程/学习页生效，避免个人中心等页面挂出不相干的课程
+            if (/\/home\/(?:course|learn)\//.test(path)) {
+                const cookie = document.cookie.match(/(?:^|;\s*)formpath=([^;]+)/);
+                if (cookie) {
+                    const decoded = decodeURIComponent(cookie[1]);
+                    const fromCookie = decoded.match(/(?:course|learn\/new)\/(\d{6,})/);
+                    if (fromCookie) return fromCookie[1];
+                }
+            }
             return null;
         }
 
@@ -971,7 +1029,6 @@
         return {
             resolveCid: resolveCid,
             createPanel: createPanel,
-            hasPanel: () => !!(panel && panel.isConnected),
             state: state,
             toggle: toggle,
             buildContent: buildContent,
@@ -981,6 +1038,7 @@
 
     // ================= 界面装配 =================
     let uiRoot = null;
+    let uiSignature = "";
 
     function createRecursiveButton() {
         const btn = document.createElement("button");
@@ -1003,14 +1061,28 @@
         return btn;
     }
 
+    // 只在能锁定课程上下文时挂界面：学习页给递归开关，能解析出 cid 就给刷评论面板
+    function detectUiContext() {
+        const path = location.pathname || "";
+        const cid = CommentBot.resolveCid();
+        let kind = "other";
+        if (/\/home\/learn\/(?:new\/\d+|index)/.test(path) || document.querySelector(".newlearn, ul.rank-1")) {
+            kind = "learn";
+        }
+        return { kind: kind, cid: cid };
+    }
+
     function ensureUi() {
         if (!document.body) return;
-        const needCommentPanel = !!CommentBot.resolveCid();
+        const ctx = detectUiContext();
+        const signature = ctx.kind + "|" + (ctx.cid || "-");
         if (uiRoot && uiRoot.isConnected) {
-            if (!needCommentPanel || CommentBot.hasPanel()) return;
-            uiRoot.appendChild(CommentBot.createPanel());
-            return;
+            if (signature === uiSignature) return;
+            uiRoot.remove();
         }
+        uiRoot = null;
+        uiSignature = signature;
+        if (ctx.kind !== "learn" && !ctx.cid) return;
         uiRoot = document.createElement("div");
         uiRoot.id = "uooc-assistant-root";
         Object.assign(uiRoot.style, {
@@ -1023,21 +1095,25 @@
             alignItems: "flex-end",
             gap: "10px"
         });
-        uiRoot.appendChild(createRecursiveButton());
-        if (needCommentPanel) uiRoot.appendChild(CommentBot.createPanel());
+        if (ctx.kind === "learn") uiRoot.appendChild(createRecursiveButton());
+        if (ctx.cid) uiRoot.appendChild(CommentBot.createPanel());
         document.body.appendChild(uiRoot);
     }
 
     // ================= 路由变化 =================
-    let lastHref = location.href;
+    // 按「页面类型 + 课程 id」判断是否真的换了课程；只看 href 会被学习页的 hash 变化误触发，
+    // 导致 playedKeys 被清空、同一小节反复点播
+    let lastRouteKey = "";
     function taskRouteWatch() {
-        if (location.href === lastHref) return;
-        lastHref = location.href;
-        failedNodes = new WeakMap();
+        const ctx = detectUiContext();
+        const key = ctx.kind + "|" + (ctx.cid || "-");
+        if (key === lastRouteKey) return;
+        lastRouteKey = key;
         playedKeys = new Set();
+        failedKeys = new Map();
         idleRounds = 0;
         pausedSince = 0;
-        log("检测到页面切换：" + location.pathname);
+        log("切换页面：" + key);
         ensureUi();
     }
 
@@ -1052,7 +1128,7 @@
     ready(() => {
         ensureUi();
         startTick();
-        log("脚本已启动 v1.5.1");
+        log("脚本已启动 v1.6.4");
     });
 
     // 调试入口：控制台可用 __UOOC__ 查看状态

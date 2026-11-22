@@ -143,3 +143,5 @@ vite.config.ts.timestamp-*
 /Burp*.xml
 *.burp
 /b
+/c
+/d
