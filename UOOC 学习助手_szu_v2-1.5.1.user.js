@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         UOOC 学习助手_szu_v2
 // @namespace    https://github.com/imdecimo/UOOC_learning_assistant
-// @version      1.5.0
+// @version      1.5.1
 // @author       decimo
 // @description  自动静音、二倍速、自动连播、自动答题(视频中非测验)、自动刷评论。递归刷课可开关，带视频看门狗与任务熔断。
 // @license      GPL
@@ -278,6 +278,7 @@
     let idleRounds = 0;
     let acted = 0;
     let failedNodes = new WeakMap();
+    let playedKeys = new Set();
 
     const nodeFailures = (node) => failedNodes.get(node) || 0;
     const failNode = (node) => failedNodes.set(node, nodeFailures(node) + 1);
@@ -295,39 +296,140 @@
         return /测验|测试|作业|考试/.test(nameSpan.innerText || nameSpan.textContent || "");
     }
 
-    function isVideoNode(node) {
-        if (!node) return false;
-        if (node.querySelector(".icon-video")) return true;
-        const nameSpan = node.querySelector(".tag-source-name");
-        const text = nameSpan ? nameSpan.innerText || nameSpan.textContent || "" : node.innerText || "";
-        return /\.mp4|视频/i.test(text);
-    }
+    // ---- 课程目录 ----
+    // UOOC 学习页是 Angular 状态驱动渲染，目录层级按需生成：
+    //   ul.rank-1 > li.catalogItem
+    //     > div.basic.chapter            大章头（点击切 chapterId）
+    //     > ul.rank-2                    仅当前大章渲染
+    //         > li#小节id > div.basic    小节（点击切 sectionId）
+    //         > div.resourcelist         仅当前小节渲染
+    //             > div.basic            资源项（span.icon-video 表示视频）
+    //         > ul.rank-3 > li           小节下的三级节点，结构同小节
+    const CATALOG_SELECTOR = "ul.rank-1, .rank-1";
+    const CHAPTER_HEADER = "div.basic.chapter";
+    const SECTION_LIST = "ul.rank-2";
+    const RESOURCE_LIST = ".resourcelist";
 
-    function findCurrentVideoNode() {
-        return document.querySelector(".basic.active")
-            || document.querySelector(".basic.current")
-            || document.querySelector(".video-list li.current")
-            || document.querySelector(".chapter-list li.current")
-            || document.querySelector("li.current.active");
-    }
-
-    function findNextVideoInSameChapter(currentNode) {
-        if (!currentNode) return null;
-        const container = currentNode.closest("ul, .chapter-list, .video-list") || currentNode.parentElement;
-        if (!container) return null;
-        const nodes = Array.from(container.querySelectorAll(".basic"));
-        const index = nodes.indexOf(currentNode);
-        if (index < 0) return null;
-        for (let i = index + 1; i < nodes.length; i++) {
-            const node = nodes[i];
-            if (node.classList.contains("complete")) continue;
-            if (isQuizNode(node)) continue;
-            if (!isVideoNode(node)) continue;
-            if (nodeFailures(node) >= CONFIG.maxNodeFailures) continue;
-            return node;
+    async function waitFor(getter, timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (!autoRecursiveFlag) return null;
+            const value = getter();
+            if (value) return value;
+            await sleep(250);
         }
         return null;
     }
+
+    // 模板里 icon-xiangxia 表示"未展开/未选中"
+    function isCollapsed(node) {
+        const icon = node ? node.querySelector("i") : null;
+        return !!(icon && icon.classList.contains("icon-xiangxia"));
+    }
+
+    function getChapterLis() {
+        const root = document.querySelector(CATALOG_SELECTOR);
+        if (!root) return [];
+        return Array.from(root.children).filter((li) => li.querySelector(CHAPTER_HEADER));
+    }
+
+    // Angular 每次状态变更都会重建 ng-if 子树，所以一律按索引重新查，不持有元素引用
+    const chapterAt = (ci) => getChapterLis()[ci] || null;
+    const sectionLisAt = (ci) => {
+        const chapterLi = chapterAt(ci);
+        return chapterLi ? Array.from(chapterLi.querySelectorAll(":scope > " + SECTION_LIST + " > li")) : [];
+    };
+    const sectionAt = (ci, si) => sectionLisAt(ci)[si] || null;
+    const pointAt = (ci, si, pi) => {
+        const sectionLi = sectionAt(ci, si);
+        if (!sectionLi) return null;
+        return sectionLi.querySelectorAll(":scope > ul.rank-3 > li")[pi] || null;
+    };
+    const pointCount = (ci, si) => {
+        const sectionLi = sectionAt(ci, si);
+        return sectionLi ? sectionLi.querySelectorAll(":scope > ul.rank-3 > li").length : 0;
+    };
+
+    async function openChapterAt(ci) {
+        const chapterLi = chapterAt(ci);
+        if (!chapterLi) return false;
+        if (chapterLi.querySelector(":scope > " + SECTION_LIST)) return true;
+        const header = chapterLi.querySelector(":scope > " + CHAPTER_HEADER) || chapterLi.querySelector(CHAPTER_HEADER);
+        if (!header) return false;
+        if (isCollapsed(header)) header.click();
+        return !!(await waitFor(() => {
+            const live = chapterAt(ci);
+            const list = live && live.querySelector(":scope > " + SECTION_LIST);
+            return list && list.children.length ? list : null;
+        }, 8000));
+    }
+
+    // 小节/三级节点：点击后会异步拉 getUnitLearn，资源列表才出现
+    async function openNodeAt(getNode) {
+        const node = getNode();
+        if (!node) return null;
+        if (node.querySelector(":scope > " + RESOURCE_LIST)) return node;
+        const head = node.querySelector(":scope > div.basic");
+        if (!head) return null;
+        if (isCollapsed(head)) head.click();
+        return await waitFor(() => {
+            const live = getNode();
+            return live && live.querySelector(":scope > " + RESOURCE_LIST) ? live : null;
+        }, 8000);
+    }
+
+    function isVideoResource(node) {
+        if (!node) return false;
+        if (node.querySelector(".icon-video")) return true;
+        const name = node.querySelector(".tag-source-name");
+        return /视频/i.test(name ? name.innerText || name.textContent || "" : "");
+    }
+
+    async function playResourceList(getContainer) {
+        for (let guard = 0; guard < 60; guard++) {
+            if (!autoRecursiveFlag) return;
+            const container = getContainer();
+            if (!container) return;
+            const list = container.querySelector(":scope > " + RESOURCE_LIST);
+            if (!list) return;
+            const resources = Array.from(list.querySelectorAll(":scope > .basic"));
+            const keyBase = container.id || nodeLabel(container);
+            let played = false;
+            for (let index = 0; index < resources.length; index++) {
+                const resource = resources[index];
+                if (resource.classList.contains("complete")) continue;
+                if (!isVideoResource(resource) || isQuizNode(resource)) continue;
+                const key = keyBase + "#" + index;
+                if (playedKeys.has(key)) continue;
+                if (nodeFailures(resource) >= CONFIG.maxNodeFailures) continue;
+                acted += 1;
+                if (await playVideoNode(resource)) {
+                    playedKeys.add(key);
+                    played = true;
+                } else {
+                    failNode(resource);
+                }
+                break;
+            }
+            if (!played) return;
+        }
+    }
+
+    async function processSectionAt(ci, si) {
+        const sectionLi = sectionAt(ci, si);
+        if (!sectionLi || sectionLi.classList.contains("unopen")) return;
+        if (await openNodeAt(() => sectionAt(ci, si))) {
+            await playResourceList(() => sectionAt(ci, si));
+        }
+        const points = pointCount(ci, si);
+        for (let pi = 0; pi < points; pi++) {
+            if (!autoRecursiveFlag) return;
+            if (await openNodeAt(() => pointAt(ci, si, pi))) {
+                await playResourceList(() => pointAt(ci, si, pi));
+            }
+        }
+    }
+
 
     async function waitForVideoReady(prevSrc, timeoutMs) {
         const deadline = Date.now() + timeoutMs;
@@ -403,77 +505,27 @@
         return false;
     }
 
-    async function drainChapter(startNode) {
-        let current = startNode;
-        for (let guard = 0; guard < 60; guard++) {
-            if (!autoRecursiveFlag) return;
-            const next = findNextVideoInSameChapter(current);
-            if (!next) return;
-            acted += 1;
-            if (await playVideoNode(next)) {
-                current = next;
-            } else {
-                failNode(next);
-                return;
-            }
-        }
-    }
-
-    async function processChapter(chapter) {
-        if (!autoRecursiveFlag || !chapter || !chapter.isConnected) return;
-        const header = chapter.firstElementChild;
-        if (header) {
-            const icon = header.querySelector("i");
-            if (icon && icon.classList.contains("icon-xiangxia")) {
-                header.click();
-                await sleep(500);
-            }
-        }
-        const children = Array.from(chapter.children);
-        for (let i = 1; i < children.length; i++) {
-            if (!autoRecursiveFlag) return;
-            const child = children[i];
-            if (!child || !child.isConnected) continue;
-            if (child.tagName === "UL") {
-                await processChapter(child);
-                continue;
-            }
-            if (child.tagName !== "DIV") continue;
-            const resources = Array.from(child.querySelectorAll(":scope > .basic"));
-            for (const node of resources) {
-                if (!autoRecursiveFlag) return;
-                if (!node.isConnected || node.classList.contains("complete")) continue;
-                if (isQuizNode(node) || !isVideoNode(node)) continue;
-                if (nodeFailures(node) >= CONFIG.maxNodeFailures) continue;
-                acted += 1;
-                if (await playVideoNode(node)) {
-                    await drainChapter(node);
-                } else {
-                    failNode(node);
-                }
-                return;
-            }
-        }
-    }
-
     async function traverse() {
-        const root = document.querySelector("ul.rank-1");
-        if (!root) {
-            log("未找到课程目录（ul.rank-1），当前可能不在学习页");
+        const total = getChapterLis().length;
+        if (!total) {
+            log("未找到课程目录，当前可能不在学习页");
             return;
         }
         acted = 0;
-        const chapters = Array.from(root.children);
-        const current = findCurrentVideoNode();
-        let start = 0;
-        if (current) {
-            const index = chapters.findIndex((chapter) => chapter.contains(current));
-            if (index >= 0) start = index;
-        }
-        for (let i = start; i < chapters.length; i++) {
+        for (let ci = 0; ci < total; ci++) {
             if (!autoRecursiveFlag) return;
-            if (!chapters[i].isConnected) continue;
-            await processChapter(chapters[i]);
+            const chapterLi = chapterAt(ci);
+            if (!chapterLi) continue;
+            if (chapterLi.classList.contains("unopen")) continue;
+            if (!(await openChapterAt(ci))) {
+                log("大章展开失败：" + nodeLabel(chapterAt(ci)));
+                continue;
+            }
+            const sectionCount = sectionLisAt(ci).length;
+            for (let si = 0; si < sectionCount; si++) {
+                if (!autoRecursiveFlag) return;
+                await processSectionAt(ci, si);
+            }
         }
     }
 
@@ -982,6 +1034,7 @@
         if (location.href === lastHref) return;
         lastHref = location.href;
         failedNodes = new WeakMap();
+        playedKeys = new Set();
         idleRounds = 0;
         pausedSince = 0;
         log("检测到页面切换：" + location.pathname);
@@ -999,7 +1052,7 @@
     ready(() => {
         ensureUi();
         startTick();
-        log("脚本已启动 v1.5.0");
+        log("脚本已启动 v1.5.1");
     });
 
     // 调试入口：控制台可用 __UOOC__ 查看状态
